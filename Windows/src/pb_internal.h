@@ -182,6 +182,10 @@ extern CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE];
 extern CONNECTION_INFO *connection_rev_table[CONNECTION_HASH_SIZE];
 extern LOGGED_CONNECTION *logged_connections;
 extern int g_logged_count;  // running length of logged_connections (guarded by `lock`)
+// Guards the g_proxy_configs slot array against concurrent add/edit/delete from the GUI
+// thread while packet/relay threads read it. A zero-initialised SRWLOCK is already in the
+// valid unlocked state, so this is safe to use before ProxyBridge_Start.
+extern SRWLOCK g_proxy_lock;
 extern PROCESS_RULE *rules_list;
 extern UINT32 g_next_rule_id;
 extern SRWLOCK lock;
