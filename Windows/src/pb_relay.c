@@ -1,5 +1,28 @@
 #include "pb_internal.h"
 
+static BOOL advance_to_next_socks5_proxy(PROXY_CONFIG **current,
+                                        UINT16 from_port,
+                                        BOOL is_udp,
+                                        BOOL is_ipv6,
+                                        const char *switch_fmt,
+                                        const char *exhausted_fmt)
+{
+    PROXY_CONFIG *next = find_next_socks5_proxy((*current)->config_id);
+    if (next == NULL || next->config_id == (*current)->config_id)
+    {
+        if (exhausted_fmt != NULL)
+            log_message(exhausted_fmt, (*current)->host, (*current)->port);
+        return FALSE;
+    }
+
+    if (from_port != 0)
+        rebind_connection_proxy(from_port, is_udp, is_ipv6, next->config_id);
+
+    log_message(switch_fmt, (*current)->host, (*current)->port, next->host, next->port);
+    *current = next;
+    return TRUE;
+}
+
 // Relay: TCP/UDP relay servers and per-connection worker threads.
 
 DWORD WINAPI udp_relay_server(LPVOID arg)
@@ -134,8 +157,25 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         cfg->udp_send_sock = INVALID_SOCKET;
                     }
                     cfg->udp_connected = FALSE;
-                    // Reconnect immediately so the next client packet is not dropped.
-                    establish_udp_associate_for_config(cfg);
+
+                    if (!establish_udp_associate_for_config(cfg))
+                    {
+                        PROXY_CONFIG *current = cfg;
+                        while (current != NULL)
+                        {
+                            if (establish_udp_associate_for_config(current))
+                                break;
+
+                            if (!advance_to_next_socks5_proxy(&current, 0, TRUE, FALSE,
+                                "[UDP RELAY] Switching UDP proxy %s:%d -> %s:%d after TCP control close",
+                                "[UDP RELAY] No more SOCKS5 proxies available for %s:%d"))
+                            {
+                                current = NULL;
+                                break;
+                            }
+                        }
+                        cfg = current;
+                    }
                     assoc_replaced = 1;   // sockets replaced - read_fds is now stale
                 }
             }
@@ -182,11 +222,25 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     // immediately so real-time streams lose at most one packet.
                     if (!cfg->udp_connected)
                     {
-                        if (!establish_udp_associate_for_config(cfg))
+                        PROXY_CONFIG *current = cfg;
+                        while (current != NULL)
                         {
-                            log_message("[UDP RELAY] UDP ASSOCIATE unavailable for %s:%d - dropping packet", cfg->host, cfg->port);
-                            continue;
+                            if (establish_udp_associate_for_config(current))
+                                break;
+
+                            if (!advance_to_next_socks5_proxy(&current, from_port, TRUE, FALSE,
+                                "[UDP RELAY] Switching UDP proxy %s:%d -> %s:%d after failure",
+                                "[UDP RELAY] UDP ASSOCIATE unavailable for %s:%d - dropping packet"))
+                            {
+                                current = NULL;
+                                break;
+                            }
                         }
+
+                        if (current == NULL)
+                            continue;
+
+                        cfg = current;
                         assoc_replaced = 1;   // new sockets created - read_fds is stale
                     }
 
@@ -213,8 +267,24 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         cfg->udp_connected = FALSE;
                         // Reconnect and retry the current packet so real-time streams
                         // lose at most one packet during a proxy reconnect event.
-                        if (establish_udp_associate_for_config(cfg))
+                        PROXY_CONFIG *current = cfg;
+                        while (current != NULL)
                         {
+                            if (establish_udp_associate_for_config(current))
+                                break;
+
+                            if (!advance_to_next_socks5_proxy(&current, from_port, TRUE, FALSE,
+                                "[UDP RELAY] Switching UDP proxy %s:%d -> %s:%d after sendto failure",
+                                "[UDP RELAY] No more SOCKS5 proxies available after sendto failure for %s:%d"))
+                            {
+                                current = NULL;
+                                break;
+                            }
+                        }
+
+                        if (current != NULL)
+                        {
+                            cfg = current;
                             sendto(cfg->udp_send_sock, (char*)send_buf, 10 + recv_len, 0,
                                    (struct sockaddr *)&cfg->udp_relay_addr, sizeof(cfg->udp_relay_addr));
                         }
@@ -621,9 +691,59 @@ DWORD WINAPI connection_handler(LPVOID arg)
     if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
     {
         log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
-        closesocket(client_sock);
-        closesocket(socks_sock);
-        return 0;
+
+        PROXY_CONFIG *current = proxy;
+        BOOL connected = FALSE;
+
+        while (current != NULL)
+        {
+            if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) != SOCKET_ERROR)
+            {
+                proxy = current;
+                connected = TRUE;
+                break;
+            }
+
+            if (!advance_to_next_socks5_proxy(&current, 0, FALSE, FALSE,
+                "[RELAY] Switching TCP proxy %s:%d -> %s:%d after connect failure",
+                "[RELAY] No more SOCKS5 proxies available for %s:%d"))
+            {
+                closesocket(client_sock);
+                closesocket(socks_sock);
+                return 0;
+            }
+
+            log_message("[RELAY] Fallback proxy %s:%d also failed (%d)", current->host, current->port, WSAGetLastError());
+            closesocket(socks_sock);
+            socks_sock = INVALID_SOCKET;
+
+            proxy_ip = current->resolved_ip ? current->resolved_ip : resolve_hostname(current->host);
+            if (proxy_ip == 0)
+            {
+                closesocket(client_sock);
+                return 0;
+            }
+
+            socks_sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (socks_sock == INVALID_SOCKET)
+            {
+                log_message("Socket creation failed (%d)", WSAGetLastError());
+                closesocket(client_sock);
+                return 0;
+            }
+
+            configure_tcp_socket(socks_sock, 4194304, 30000);
+            memset(&socks_addr, 0, sizeof(socks_addr));
+            socks_addr.sin_family = AF_INET;
+            socks_addr.sin_addr.s_addr = proxy_ip;
+            socks_addr.sin_port = htons(current->port);
+        }
+
+        if (!connected)
+        {
+            closesocket(client_sock);
+            return 0;
+        }
     }
 
     if (proxy->type == PROXY_TYPE_SOCKS5)

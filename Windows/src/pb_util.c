@@ -105,12 +105,22 @@ int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int
     int result = 0;
     if (connect(s, addr, addrlen) == SOCKET_ERROR)
     {
-        if (WSAGetLastError() != WSAEWOULDBLOCK)
+        int error = WSAGetLastError();
+        if (error == WSAEISCONN)
+        {
+            result = 0;  // already connected
+        }
+        else
+        {
+            log_message("[connect_with_timeout] connect() returned SOCKET_ERROR, WSAGetLastError()=%d", error);
+        }
+        if (error != WSAEWOULDBLOCK)
         {
             result = SOCKET_ERROR;
         }
         else
         {
+            log_message("[connect_with_timeout] connect() is non-blocking, waiting for select() with timeout %d ms", timeout_ms);
             fd_set wfds, efds;
             FD_ZERO(&wfds); FD_SET(s, &wfds);
             FD_ZERO(&efds); FD_SET(s, &efds);
@@ -128,6 +138,7 @@ int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int
                 if (so_err != 0)
                     result = SOCKET_ERROR;
             }
+            log_message("[connect_with_timeout] select() returned %d, result=%d", sel, result);
         }
     }
 

@@ -270,6 +270,25 @@ UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp)
     return proxy_config_id;
 }
 
+void rebind_connection_proxy(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 new_proxy_config_id)
+{
+    AcquireSRWLockExclusive(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port && conn->is_udp == is_udp && conn->is_ipv6 == is_ipv6)
+        {
+            conn->proxy_config_id = new_proxy_config_id;
+            break;
+        }
+        conn = conn->next;
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+}
+
 void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
 {
     AcquireSRWLockExclusive(&lock);

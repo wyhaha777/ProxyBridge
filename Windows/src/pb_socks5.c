@@ -339,12 +339,24 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
         return FALSE;
     if (cfg->type != PROXY_TYPE_SOCKS5)
         return FALSE;
+    if (cfg->udp_connected)
+        return TRUE;
+
+    // Reconnect-only single-flight guard: the first establishment must always be allowed.
+    // Once a control socket is dropped, we serialize retries so one proxy config isn't
+    // hammered by multiple code paths at the same time.
+    if (InterlockedCompareExchange(&cfg->udp_reconnect_inflight, 1, 0) != 0)
+    {
+        log_message("[UDP ASSOC] Reconnect already in flight for %s:%d, skipping", cfg->host, cfg->port);
+        return FALSE;
+    }
 
     // Prevent retry spam - only try every 1 second per config
     ULONGLONG now = GetTickCount64();
     if (now - cfg->last_udp_attempt < 1000)
     {
         log_message("[UDP ASSOC] Retry guard active for %s:%d, skipping", cfg->host, cfg->port);
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
     }
 
@@ -365,14 +377,20 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
     // Create TCP control connection
     SOCKET tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_sock == INVALID_SOCKET)
+    {
+        log_message("[UDP ASSOC] Failed to create TCP socket");
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
+    }
 
     configure_tcp_socket(tcp_sock, 262144, 3000);
 
     UINT32 socks5_ip = resolve_hostname(cfg->host);
     if (socks5_ip == 0)
     {
+        log_message("[UDP ASSOC] Failed to resolve SOCKS5 proxy %s", cfg->host);
         closesocket(tcp_sock);
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
     }
 
@@ -385,24 +403,45 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
     // Bounded connect: a dead/unreachable proxy config fails in ~2s instead of stalling
     // the single-threaded relay for the full OS SYN timeout (~21s), which was delaying
     // real packets that use a *different*, working proxy config.
-    if (connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 2000) == SOCKET_ERROR)
+    if (connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 5000) == SOCKET_ERROR)
     {
+        log_message("[UDP ASSOC] Failed to connect to SOCKS5 proxy %s:%d (%d)", cfg->host, cfg->port, WSAGetLastError());
         closesocket(tcp_sock);
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
     }
 
     if (socks5_udp_associate_with_config(tcp_sock, &cfg->udp_relay_addr, cfg) != 0)
     {
+        log_message("[UDP ASSOC] Failed to establish UDP ASSOCIATE with SOCKS5 proxy %s:%d", cfg->host, cfg->port);
         closesocket(tcp_sock);
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
     }
 
-    // Many SOCKS5 servers return 0.0.0.0 as BND.ADDR in
-    // the UDP ASSOCIATE reply as per RFC 1928 says "use the same address
-    // as the TCP control connection".  sendto(0.0.0.0:PORT) fails with
-    // WSAEADDRNOTAVAIL (10049), so replace it with the proxy's resolved IP.
-    if (cfg->udp_relay_addr.sin_addr.s_addr == INADDR_ANY)
+    // Many SOCKS5 servers return 0.0.0.0 or even 127.0.0.1 as BND.ADDR in the
+    // UDP ASSOCIATE reply. RFC 1928 allows 0.0.0.0 as a wildcard, but it is not a
+    // usable remote relay endpoint for sendto(); loopback is equally unusable. Both
+    // must be replaced with the actual proxy IP so UDP packets are sent to a real
+    // remote endpoint instead of the local machine.
+    if (cfg->udp_relay_addr.sin_addr.s_addr == INADDR_ANY ||
+        cfg->udp_relay_addr.sin_addr.s_addr == htonl(INADDR_LOOPBACK))
+    {
+        char relay_ip[32];
+        snprintf(relay_ip, sizeof(relay_ip), "%u.%u.%u.%u",
+            (unsigned int)((unsigned char *)&cfg->udp_relay_addr.sin_addr.s_addr)[0],
+            (unsigned int)((unsigned char *)&cfg->udp_relay_addr.sin_addr.s_addr)[1],
+            (unsigned int)((unsigned char *)&cfg->udp_relay_addr.sin_addr.s_addr)[2],
+            (unsigned int)((unsigned char *)&cfg->udp_relay_addr.sin_addr.s_addr)[3]);
+        unsigned char *proxy_bytes = (unsigned char *)&socks5_ip;
+        log_message("[UDP ASSOC] Proxy %s:%d returned unusable UDP relay address %s; using proxy IP %u.%u.%u.%u instead",
+            cfg->host, cfg->port, relay_ip,
+            (unsigned int)proxy_bytes[0],
+            (unsigned int)proxy_bytes[1],
+            (unsigned int)proxy_bytes[2],
+            (unsigned int)proxy_bytes[3]);
         cfg->udp_relay_addr.sin_addr.s_addr = socks5_ip;
+    }
 
     // haandshake completed remove the 3second timeout so the control socket stays open indefinitely
     // keepalives below will detect actual disconnection.
@@ -427,12 +466,14 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
         closesocket(cfg->udp_tcp_ctrl);
         cfg->udp_tcp_ctrl = INVALID_SOCKET;
         cfg->udp_connected = FALSE;
+        InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
         return FALSE;
     }
 
     configure_udp_socket(cfg->udp_send_sock, 262144, 30000);
 
     cfg->udp_connected = TRUE;
+    InterlockedExchange(&cfg->udp_reconnect_inflight, 0);
     log_message("UDP ASSOCIATE established with SOCKS5 proxy %s:%d (UDP relay at %s:%d)",
         cfg->host, cfg->port,
         inet_ntoa(cfg->udp_relay_addr.sin_addr), ntohs(cfg->udp_relay_addr.sin_port));

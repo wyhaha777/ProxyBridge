@@ -166,6 +166,7 @@ typedef struct {
     BOOL send_domain_to_proxy;  // TRUE = proxy resolves DNS (send hostname), FALSE = send IP
     UINT32 resolved_ip;         // cached at add/edit time - avoids DNS per connection
     ULONGLONG last_udp_attempt;
+    volatile LONG udp_reconnect_inflight;
     SOCKET udp_tcp_ctrl;
     SOCKET udp_send_sock;
     struct sockaddr_in udp_relay_addr;
@@ -300,6 +301,7 @@ void update_has_active_rules(void);
 PROXY_CONFIG* find_proxy_config(UINT32 config_id);
 BOOL any_socks5_config(void);
 BOOL is_proxy_config_referenced(UINT32 config_id);
+PROXY_CONFIG* find_next_socks5_proxy(UINT32 current_config_id);
 
 // ---- pb_dns.c ----
 void dns_cache_init(void);
@@ -333,6 +335,7 @@ void rev_insert(CONNECTION_INFO *c);
 void rev_unlink(CONNECTION_INFO *c);
 void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id);
 void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id);
+void rebind_connection_proxy(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 new_proxy_config_id);
 BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id);
 BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port);
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);

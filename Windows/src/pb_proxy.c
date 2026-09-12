@@ -52,6 +52,36 @@ BOOL is_proxy_config_referenced(UINT32 config_id)
     return referenced;
 }
 
+PROXY_CONFIG* find_next_socks5_proxy(UINT32 current_config_id)
+{
+    PROXY_CONFIG *first_valid = NULL;
+    BOOL found_current = FALSE;
+
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *candidate = &g_proxy_configs[i];
+        if (candidate->type != PROXY_TYPE_SOCKS5)
+            continue;
+        if (candidate->host[0] == '\0' || candidate->port == 0)
+            continue;
+
+        if (first_valid == NULL)
+            first_valid = candidate;
+
+        if (found_current)
+            return candidate;
+
+        if (candidate->config_id == current_config_id)
+            found_current = TRUE;
+    }
+
+    // If current proxy is the last valid one, wrap around to the beginning.
+    if (first_valid != NULL && first_valid->config_id != current_config_id)
+        return first_valid;
+
+    return NULL;
+}
+
 PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password, BOOL send_domain_to_proxy)
 {
     if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
