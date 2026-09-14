@@ -161,7 +161,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     if (!establish_udp_associate_for_config(cfg))
                     {
                         PROXY_CONFIG *current = cfg;
-                        while (current != NULL)
+                        int attempts_left = g_proxy_config_count;   // bound: find_next wraps around, so cap tries to one per config
+                        while (current != NULL && attempts_left-- > 0)
                         {
                             if (establish_udp_associate_for_config(current))
                                 break;
@@ -223,7 +224,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     if (!cfg->udp_connected)
                     {
                         PROXY_CONFIG *current = cfg;
-                        while (current != NULL)
+                        int attempts_left = g_proxy_config_count;   // bound: find_next wraps around, so cap tries to one per config
+                        while (current != NULL && attempts_left-- > 0)
                         {
                             if (establish_udp_associate_for_config(current))
                                 break;
@@ -237,7 +239,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                             }
                         }
 
-                        if (current == NULL)
+                        if (current == NULL || !current->udp_connected)
                             continue;
 
                         cfg = current;
@@ -268,7 +270,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         // Reconnect and retry the current packet so real-time streams
                         // lose at most one packet during a proxy reconnect event.
                         PROXY_CONFIG *current = cfg;
-                        while (current != NULL)
+                        int attempts_left = g_proxy_config_count;   // bound: find_next wraps around, so cap tries to one per config
+                        while (current != NULL && attempts_left-- > 0)
                         {
                             if (establish_udp_associate_for_config(current))
                                 break;
@@ -282,7 +285,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                             }
                         }
 
-                        if (current != NULL)
+                        if (current != NULL && current->udp_connected)
                         {
                             cfg = current;
                             sendto(cfg->udp_send_sock, (char*)send_buf, 10 + recv_len, 0,
