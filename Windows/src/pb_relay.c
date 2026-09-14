@@ -688,32 +688,30 @@ DWORD WINAPI connection_handler(LPVOID arg)
     socks_addr.sin_addr.s_addr = proxy_ip;
     socks_addr.sin_port = htons(proxy->port);
 
-    if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
+    // Bounded connect: a plain blocking connect() ignores SO_SNDTIMEO on Windows and
+    // stalls for the OS SYN timeout (~21s) on an unreachable proxy. connect_with_timeout
+    // caps each attempt. Fallbacks are tried at most once per config so a set of dead
+    // proxies can't be retried in an endless loop that floods them with SYNs (which gets
+    // the source IP rate-limited/blocked by the proxy/firewall).
+    BOOL connected =
+        (connect_with_timeout(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 5000) != SOCKET_ERROR);
+
+    if (!connected)
     {
         log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
 
         PROXY_CONFIG *current = proxy;
-        BOOL connected = FALSE;
+        int attempts_left = g_proxy_config_count;   // upper bound: try each config once
 
-        while (current != NULL)
+        while (!connected && attempts_left-- > 0)
         {
-            if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) != SOCKET_ERROR)
-            {
-                proxy = current;
-                connected = TRUE;
-                break;
-            }
-
             if (!advance_to_next_socks5_proxy(&current, 0, FALSE, FALSE,
                 "[RELAY] Switching TCP proxy %s:%d -> %s:%d after connect failure",
                 "[RELAY] No more SOCKS5 proxies available for %s:%d"))
             {
-                closesocket(client_sock);
-                closesocket(socks_sock);
-                return 0;
+                break;
             }
 
-            log_message("[RELAY] Fallback proxy %s:%d also failed (%d)", current->host, current->port, WSAGetLastError());
             closesocket(socks_sock);
             socks_sock = INVALID_SOCKET;
 
@@ -737,11 +735,21 @@ DWORD WINAPI connection_handler(LPVOID arg)
             socks_addr.sin_family = AF_INET;
             socks_addr.sin_addr.s_addr = proxy_ip;
             socks_addr.sin_port = htons(current->port);
+
+            if (connect_with_timeout(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 5000) != SOCKET_ERROR)
+            {
+                proxy = current;
+                connected = TRUE;
+                break;
+            }
+
+            log_message("[RELAY] Fallback proxy %s:%d also failed (%d)", current->host, current->port, WSAGetLastError());
         }
 
         if (!connected)
         {
             closesocket(client_sock);
+            if (socks_sock != INVALID_SOCKET) closesocket(socks_sock);
             return 0;
         }
     }
